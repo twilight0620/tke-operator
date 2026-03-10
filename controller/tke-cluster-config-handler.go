@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"math/rand"
 	"time"
 
 	tcdriver "github.com/cnrancher/tke-operator/driver"
@@ -21,6 +22,10 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/retry"
+)
+
+const (
+	randStringLen = 8
 )
 
 const (
@@ -227,7 +232,43 @@ func (h *Handler) OnTkeConfigRemoved(key string, config *tkev1.TKEClusterConfig)
 		return config, err
 	}
 
+	if err := h.cleanupCreatedNetworking(config); err != nil {
+		return config, err
+	}
+
 	return config, nil
+}
+
+// cleanupCreatedNetworking deletes VPC and subnet resources that were auto-created by the operator.
+func (h *Handler) cleanupCreatedNetworking(config *tkev1.TKEClusterConfig) error {
+	if config.Status.CreatedSubnetID == "" && config.Status.CreatedVpcID == "" {
+		return nil
+	}
+
+	driver, err := tcdriver.GetDriver(h.secretsCache, config.Spec.TKECredentialSecret, config.Spec.Region)
+	if err != nil {
+		return fmt.Errorf("failed to get driver for networking cleanup: %w", err)
+	}
+
+	if config.Status.CreatedSubnetID != "" {
+		logrus.Infof("cleaning up auto-created subnet [%s] for cluster [%s]", config.Status.CreatedSubnetID, config.Name)
+		if err := driver.VPCClient.DeleteSubnet(config.Status.CreatedSubnetID); err != nil {
+			logrus.Warnf("failed to delete auto-created subnet [%s]: %v", config.Status.CreatedSubnetID, err)
+		} else {
+			logrus.Infof("auto-created subnet [%s] deleted successfully", config.Status.CreatedSubnetID)
+		}
+	}
+
+	if config.Status.CreatedVpcID != "" {
+		logrus.Infof("cleaning up auto-created VPC [%s] for cluster [%s]", config.Status.CreatedVpcID, config.Name)
+		if err := driver.VPCClient.DeleteVPC(config.Status.CreatedVpcID); err != nil {
+			logrus.Warnf("failed to delete auto-created VPC [%s]: %v", config.Status.CreatedVpcID, err)
+		} else {
+			logrus.Infof("auto-created VPC [%s] deleted successfully", config.Status.CreatedVpcID)
+		}
+	}
+
+	return nil
 }
 
 // importCluster returns an active cluster spec containing the given config's clusterName and region/zone
@@ -290,6 +331,11 @@ func (h *Handler) create(config *tkev1.TKEClusterConfig) (*tkev1.TKEClusterConfi
 			return config, err
 		}
 
+		config, err = h.generateAndSetNetworking(driver, config)
+		if err != nil {
+			return config, err
+		}
+
 		responseClusterId, err := driver.TKEClient.CreateCluster(config.Spec)
 		if err != nil {
 			return config, err
@@ -308,6 +354,23 @@ func (h *Handler) create(config *tkev1.TKEClusterConfig) (*tkev1.TKEClusterConfi
 
 			result = result.DeepCopy()
 			result.Spec.ClusterID = *responseClusterId
+			if config.Spec.ClusterBasicSettings != nil {
+				result.Spec.ClusterBasicSettings.VpcID = config.Spec.ClusterBasicSettings.VpcID
+			}
+			if config.Spec.ClusterCIDRSettings != nil {
+				result.Spec.ClusterCIDRSettings.SubnetID = config.Spec.ClusterCIDRSettings.SubnetID
+			}
+			// Propagate cluster-level VpcID/SubnetID to node pools when auto-created (so CreateClusterNodePool has correct IDs)
+			if config.Spec.ClusterBasicSettings != nil && config.Spec.ClusterCIDRSettings != nil {
+				for i := range result.Spec.NodePoolList {
+					if result.Spec.NodePoolList[i].AutoScalingGroupPara.VpcID == "" {
+						result.Spec.NodePoolList[i].AutoScalingGroupPara.VpcID = config.Spec.ClusterBasicSettings.VpcID
+					}
+					if len(result.Spec.NodePoolList[i].AutoScalingGroupPara.SubnetIDs) == 0 && config.Spec.ClusterCIDRSettings.SubnetID != "" {
+						result.Spec.NodePoolList[i].AutoScalingGroupPara.SubnetIDs = []string{config.Spec.ClusterCIDRSettings.SubnetID}
+					}
+				}
+			}
 			result, getErr = h.tkeCC.Update(result)
 			if getErr != nil {
 				return getErr
@@ -326,13 +389,17 @@ func (h *Handler) create(config *tkev1.TKEClusterConfig) (*tkev1.TKEClusterConfi
 			if getErr != nil {
 				return getErr
 			}
-			if result.Status.Phase == tkeConfigCreatingPhase && result.Status.FailureMessage == "" {
+			if result.Status.Phase == tkeConfigCreatingPhase && result.Status.FailureMessage == "" &&
+				result.Status.CreatedVpcID == config.Status.CreatedVpcID &&
+				result.Status.CreatedSubnetID == config.Status.CreatedSubnetID {
 				config = result
 				return nil
 			}
 			result = result.DeepCopy()
 			result.Status.Phase = tkeConfigCreatingPhase
 			result.Status.FailureMessage = ""
+			result.Status.CreatedVpcID = config.Status.CreatedVpcID
+			result.Status.CreatedSubnetID = config.Status.CreatedSubnetID
 			result, getErr = h.tkeCC.UpdateStatus(result)
 			if getErr != nil {
 				return getErr
@@ -346,6 +413,75 @@ func (h *Handler) create(config *tkev1.TKEClusterConfig) (*tkev1.TKEClusterConfi
 	}
 
 	return config, err
+}
+
+// generateAndSetNetworking auto-creates VPC and/or subnet when the user does not provide
+// existing resource IDs. It only calls cloud APIs and sets values on the in-memory config.
+// Persistence to the CRD is handled by the caller (create method's existing RetryOnConflict).
+func (h *Handler) generateAndSetNetworking(driver *tcdriver.Driver, config *tkev1.TKEClusterConfig) (*tkev1.TKEClusterConfig, error) {
+	if config.Spec.ClusterBasicSettings == nil {
+		return config, nil
+	}
+
+	needCreateVPC := config.Spec.ClusterBasicSettings.VpcID == ""
+	needCreateSubnet := config.Spec.ClusterCIDRSettings != nil && config.Spec.ClusterCIDRSettings.SubnetID == ""
+
+	if !needCreateVPC && !needCreateSubnet {
+		return config, nil
+	}
+
+	ns := config.Spec.NetworkSettings
+	if ns == nil {
+		ns = &tkev1.NetworkSettings{}
+	}
+
+	if needCreateVPC {
+		if ns.VpcCIDR == "" {
+			return config, fmt.Errorf("networkSettings.vpcCidr is required for auto-creating VPC in cluster [%s]", config.Name)
+		}
+		vpcName := fmt.Sprintf("Default_VPC_%s", randString(randStringLen))
+		logrus.Infof("auto-creating VPC [%s] with CIDR [%s] for cluster [%s]", vpcName, ns.VpcCIDR, config.Name)
+
+		vpcID, err := driver.VPCClient.CreateVPC(vpcName, ns.VpcCIDR)
+		if err != nil {
+			return config, fmt.Errorf("failed to auto-create VPC for cluster [%s]: %w", config.Name, err)
+		}
+		logrus.Infof("VPC [%s] created successfully for cluster [%s]", vpcID, config.Name)
+
+		config.Spec.ClusterBasicSettings.VpcID = vpcID
+		config.Status.CreatedVpcID = vpcID
+	}
+
+	if needCreateSubnet {
+		if ns.SubnetCIDR == "" {
+			return config, fmt.Errorf("networkSettings.subnetCidr is required for auto-creating subnet in cluster [%s]", config.Name)
+		}
+		if ns.Zone == "" {
+			return config, fmt.Errorf("networkSettings.zone is required for auto-creating subnet in cluster [%s]", config.Name)
+		}
+		subnetName := fmt.Sprintf("Default_Subnet_%s", randString(randStringLen))
+		logrus.Infof("auto-creating subnet [%s] with CIDR [%s] in zone [%s] for cluster [%s]", subnetName, ns.SubnetCIDR, ns.Zone, config.Name)
+
+		subnetID, err := driver.VPCClient.CreateSubnet(config.Spec.ClusterBasicSettings.VpcID, subnetName, ns.SubnetCIDR, ns.Zone)
+		if err != nil {
+			return config, fmt.Errorf("failed to auto-create subnet for cluster [%s]: %w", config.Name, err)
+		}
+		logrus.Infof("subnet [%s] created successfully for cluster [%s]", subnetID, config.Name)
+
+		config.Spec.ClusterCIDRSettings.SubnetID = subnetID
+		config.Status.CreatedSubnetID = subnetID
+	}
+
+	return config, nil
+}
+
+func randString(n int) string {
+	const letters = "abcdefghijklmnopqrstuvwxyz0123456789"
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = letters[rand.Intn(len(letters))]
+	}
+	return string(b)
 }
 
 func (h *Handler) waitForCreationComplete(config *tkev1.TKEClusterConfig) (*tkev1.TKEClusterConfig, error) {

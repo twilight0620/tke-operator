@@ -1,0 +1,65 @@
+# 自动创建 VPC/子网 测试用 YAML（基于你当前环境可运行的 TKE 配置）
+# 与现有 YAML 的差异：vpcId/subnetId 留空，并增加 networkSettings，由后端自动创建 VPC 和子网
+#
+# 使用前请确认：
+# 1. 使用新的集群名（不要与已有 c-n8zvg 重复），或先删旧集群再测
+# 2. 若通过 Rancher 创建，会自动带 ownerReferences；若 kubectl apply 可去掉 ownerReferences
+apiVersion: tke.pandaria.io/v1
+kind: TKEClusterConfig
+metadata:
+  name: c-auto-vpc-test
+  namespace: cattle-global-data
+spec:
+  tkeCredentialSecret: cattle-global-data:cc-vf44w
+  region: ap-guangzhou
+  imported: false
+  # 以下三个字段必填，用于自动创建 VPC 和子网；zone 需与 region 匹配（广州可用区如 ap-guangzhou-3）
+  networkSettings:
+    zone: ap-guangzhou-3
+    vpcCidr: "10.0.0.0/16"
+    subnetCidr: "10.0.0.0/24"
+  clusterBasicSettings:
+    clusterName: lhl-auto-vpc-test
+    clusterOs: tlinux3.1x86_64
+    clusterType: MANAGED_CLUSTER
+    clusterVersion: "1.34.1"
+    clusterLevel: L5
+    isAutoUpgrade: true
+    vpcId: ""   # 留空触发自动创建
+  clusterCIDRSettings:
+    clusterCIDR: 172.16.0.0/16
+    ignoreClusterCIDRConflict: true
+    maxClusterServiceNum: 1024
+    maxNodePodNum: 64
+    osCustomizeType: GENERAL
+    subnetId: ""   # 留空触发自动创建
+  clusterEndpoint:
+    enable: true
+    securityGroup: sg-ed6w3fih
+    subnetId: ""   # 留空，创建后会用自动创建的子网
+  clusterAdvancedSettings:
+    containerRuntime: containerd
+  nodePoolList:
+    - autoScalingGroupPara:
+        desiredCapacity: 1
+        maxSize: 1
+        minSize: 0
+        vpcId: ""   # 留空，controller 会用自动创建的 VpcID 填充
+        subnetIds: []   # 留空，controller 会用自动创建的 SubnetID 填充
+      enableAutoscale: true
+      launchConfigurePara:
+        instanceChargeType: POSTPAID_BY_HOUR
+        instanceType: SA9.LARGE8
+        internetChargeType: TRAFFIC_POSTPAID_BY_HOUR
+        internetMaxBandwidthOut: 10
+        keyIds:
+          - skey-0anta95h
+        publicIpAssigned: true
+        securityGroupIds:
+          - sg-ce521meb
+        systemDisk:
+          diskSize: 20
+          diskType: CLOUD_SSD
+      name: nodepool-auto-vpc
+      nodePoolOs: tlinux3.1x86_64
+      osCustomizeType: GENERAL

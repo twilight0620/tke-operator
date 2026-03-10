@@ -196,6 +196,19 @@ spec:
                 type: array
               imported:
                 type: boolean
+              networkSettings:
+                nullable: true
+                properties:
+                  subnetCidr:
+                    nullable: true
+                    type: string
+                  vpcCidr:
+                    nullable: true
+                    type: string
+                  zone:
+                    nullable: true
+                    type: string
+                type: object
               nodePoolList:
                 items:
                   properties:
@@ -379,6 +392,12 @@ spec:
             type: object
           status:
             properties:
+              createdSubnetId:
+                nullable: true
+                type: string
+              createdVpcId:
+                nullable: true
+                type: string
               failureMessage:
                 nullable: true
                 type: string
